@@ -14,6 +14,8 @@ from subprocess import PIPE, Popen, TimeoutExpired
 from tempfile import NamedTemporaryFile
 from typing import Dict, List
 import warnings
+import re
+from Bio import Phylo
 
 from helperlibs.wrappers.io import TemporaryDirectory
 
@@ -351,3 +353,293 @@ def run_muscle_single(seq_name: str, seq: str, comparison_file: str) -> Dict[str
                                    seq_name))
             fasta = read_fasta(temp_out.name)
     return fasta
+
+
+def align_domain_to_reference(reference_alignment: str, seq_names: list, seq_seqs: list) -> Dict[str, str]:
+    """ Aligns PROTEIN domains to a reference PROTEIN alignment via
+         muscle then muscle profile
+
+        Arguments:
+            reference_alignment: path to the reference alignment
+            seq_names: list of all the sequence names (str)
+            seq_seqs: list of protein sequences (str) (NOTE: assumes same index as seq_names)
+
+        Returns:
+            a fasta alignment
+    """
+    config = get_config()
+
+    ## Align all queries to each other
+    with NamedTemporaryFile(mode="w+") as query_unaligned:
+        write_fasta(seq_names,seq_seqs, query_unaligned.name)
+        with NamedTemporaryFile(mode="w+") as query_aligned:
+            result = execute(["muscle", "-quiet",
+                              "-in", query_unaligned.name,
+                              "-out", query_aligned.name])
+            if not result.successful():
+                raise RuntimeError("muscle returned %d: %r while aligning query %s" % (
+                    result.return_code, result.stderr.replace("\n", ""),
+                    query_unaligned.name))
+            with NamedTemporaryFile(mode="w+") as profile_aligned:
+                profile_result = execute(["muscle", "profile", "-quiet",
+                                          "-in1", reference_alignment,
+                                          "-in2", query_aligned.name,
+                                          "-out", profile_aligned.name])
+                if not profile_result.successful():
+                    raise RuntimeError("muscle returned %d: %r while aligning query %s to ref %s" % (
+                        profile_result.return_code, profile_result.stderr.replace("\n", ""),
+                        query_aligned.name, reference_alignment))
+                afa = read_fasta(profile_aligned.name)
+    return afa
+
+
+def run_pplacer(reference_tree: str, reference_alignment: str, reference_package: str, alignment: Dict[str, str]) -> Phylo.BaseTree:
+    """ Runs pplacer, places query sequences onto a precalculated phylogeny
+
+        Arguments:
+            reference_alignment: path to the reference alignment
+            alignment: fasta Dictionary of seq names (str) to seqs (str)
+
+        Returns:
+            path to the resulting pplacer singular tree, newick format
+    """
+    config = get_config()
+
+    anames, aseqs = [], []
+    for k, v in alignment.items():
+        anames.append(k)
+        aseqs.append(v)
+        
+    with NamedTemporaryFile(mode="w+", suffix='.fasta') as aln:
+        write_fasta(anames, aseqs, aln.name)
+        with NamedTemporaryFile(mode="w+", suffix='.jplace') as jplace:
+            pplacer_result = execute(["pplacer",
+                          "-t", reference_tree,
+                          "-r", reference_alignment,
+                          "-o", jplace.name,
+                          "-c", reference_package,
+                          aln.name])
+            if not pplacer_result.successful():
+                raise RuntimeError("pplacer returned %d: %r while placing query alignment %s" % (
+                    pplacer_result.return_code, pplacer_result.stderr.replace("\n", ""),
+                    aln.name))
+            ## Summarize to a single tree
+            with NamedTemporaryFile(mode="w+", suffix='.nwk') as gup:
+                guppy_result = execute(["guppy", "sing", jplace.name, "-o", gup.name])
+                if not guppy_result.successful():
+                    raise RuntimeError("guppy sing returned %d: %r while summarizing %s" % (
+                        guppy_result.return_code, guppy_result.stderr.replace("\n", ""),
+                        jplace.name))
+                pplacer_tree = Phylo.read(gup.name, 'newick')
+    return(pplacer_tree)
+
+def run_mafft_predicat_trim(fa: Dict[str, str]) -> Dict[str, str]:
+    """ Runs mafft for overhang trimming within predicat (SANDPUMA)
+
+        Arguments:
+            fa: fasta Dictionary of seq names (str) to seqs (str)
+
+        Returns:
+            aligned fasta Dictionary of seq names (str) to seqs (str)
+    """
+    fnames, fseqs = [], []
+    for k, v in fa.items():
+        fnames.append(k)
+        fseqs.append(v)
+    
+    with NamedTemporaryFile(mode="w+") as query_unaligned:
+        write_fasta(fnames, fseqs, query_unaligned.name)
+        with NamedTemporaryFile(mode="w+") as query_aligned:
+            mafft_result = execute(["mafft", "--quiet",
+                                    "--namelength", "70",
+                                    "--op",  "5",
+                                    query_unaligned.name],
+                                   stdout=query_aligned) ## Note: stdout requires a file object, not a name
+            if not mafft_result.successful():
+                raise RuntimeError("mafft returned %d: %r while performing initial prediCAT trim alignment" % (
+                    mafft_result.return_code, mafft_result.stderr.replace("\n", "") ))
+            return read_fasta(query_aligned.name)
+
+def run_muscle_profile_sandpuma(ref_afa: str, query_fa: Dict[str, str]) -> Dict[str, str]:
+    """ Runs muscle profile within predicat or svms (SANDPUMA)
+        Arguments:
+            ref_afa: aligned fasta
+            query_fa: single entry fasta Dictionary of seq names (str) to seqs (str)
+
+        Returns:
+            aligned fasta Dictionary of all seq names (str) to seqs (str)
+    """
+    fnames, fseqs = [], []
+    for k, v in query_fa.items():
+        fnames.append(k)
+        fseqs.append(v)
+    with NamedTemporaryFile(mode="w+") as query_unaligned:
+        write_fasta(fnames, fseqs, query_unaligned.name)
+        with NamedTemporaryFile(mode="w+") as all_aligned:
+            muscle_result = execute(["muscle", "-profile",
+                                     "-in1", ref_afa,
+                                     "-in2", query_unaligned.name,
+                                     "-out", all_aligned.name])
+            if not muscle_result.successful():
+                raise RuntimeError("muscle -profile returned %d: %r while performing prediCAT reference alignment" % (
+                    muscle_result.return_code, muscle_result.stderr.replace("\n", "") ))
+            return read_fasta(all_aligned.name)
+
+
+def mafft_sandpuma_asm(toalign: Dict[str, str], gapopen: float) -> Dict[str, str]:
+    """ Runs mafft for initial alignment for stachelhaus code extraction (SANDPUMA)
+
+        Arguments:
+            toalign: fasta Dictionary of seq names (str) to seqs (str)
+            gapopen: gapopen penalty
+
+
+        Returns:
+            aligned fasta Dictionary of all seq names (str) to seqs (str)
+    """
+    fnames, fseqs = [], []
+    for k, v in toalign.items():
+        fnames.append(k)
+        fseqs.append(v)
+    with NamedTemporaryFile(mode="w+") as query_unaligned:
+        write_fasta(fnames, fseqs, query_unaligned.name)
+        with NamedTemporaryFile(mode="w+") as all_aligned:
+            mafft_result = execute(["mafft", "--quiet",
+                                     "--op", str(gapopen),
+                                     "--namelength", "60",
+                                     query_unaligned.name],
+                                   stdout=all_aligned)
+            if not mafft_result.successful():
+                raise RuntimeError("mafft returned %d: %r while performing ASM seed alignment" % (
+                    mafft_result.return_code, mafft_result.stderr.replace("\n", "") ))
+            return read_fasta(all_aligned.name)
+
+def run_svm_sandpuma(seq: str, nrpsdir: str) -> str:
+    """ Runs SVM predictions based on NRPSPredictor2 as part of SANDPUMA
+
+        Arguments:
+            seq: 34 char A-domanin code
+            nrpsdir: NRPSPredictor2 directory
+
+
+        Returns:
+            SVM prediction
+    """
+    libs = nrpsdir+'/lib'
+    build = nrpsdir+'/build'
+    datadir = nrpsdir+'/data'
+
+    os.environ['NRPS2BASEDIR'] = nrpsdir
+    os.environ['LIBS'] = libs
+    os.environ['BUILD'] = build
+    os.environ['DATADIR'] = datadir
+
+    pred = 'no_call'
+    
+    with NamedTemporaryFile(mode="w+") as sig:
+        out_file = open(sig.name, "w")
+        out_file.write("%s\t%s\n" % (seq, 'query'))
+        out_file.close()
+        with NamedTemporaryFile(mode="w+") as rep:
+            with NamedTemporaryFile(mode="w+") as o:
+                svm_result = execute(["java",
+                                      "-Ddatadir="+datadir,
+                                      "-cp", ':'.join([build+'/NRPSpredictor2.jar',
+                                                       libs+'/java-getopt-1.0.13.jar',
+                                                       libs+'/Utilities.jar',
+                                                       libs+'/libsvm.jar']),
+                                      "org.roettig.NRPSpredictor2.NRPSpredictor2",
+                                      "-i", sig.name,
+                                      "-r", rep.name,
+                                      "-s", "1"],
+                                     stdout=o)
+                if not svm_result.successful():
+                    raise RuntimeError("SVM processing returned %d: %r" % (
+                        svm_result.return_code, svm_result.stderr.replace("\n", "") ))
+                with open(rep.name, "r") as r:
+                    for line in r:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line[0] == '#':
+                            continue
+                        result = line.split("\t")
+                        pred = result[6]
+                        break
+    return pred
+
+def run_phmm_sandpuma(queryfa: Dict[str, str], hmmdb: str) -> str:
+    """ Runs pHMM predictions as part of SANDPUMA
+
+        Arguments:
+            queryfa: single entry fasta Dictionary of seq names (str) to seqs (str)
+            hmmdb: path to the hmmdb
+
+        Returns:
+            pHMM prediction
+    """
+    fnames, fseqs = [], []
+    for k, v in queryfa.items():
+        fnames.append(k)
+        fseqs.append(v)
+    with NamedTemporaryFile(mode="w+") as query:
+        write_fasta(fnames, fseqs, query.name)
+        with NamedTemporaryFile(mode="w+") as out:
+            with NamedTemporaryFile(mode="w+") as tbl:
+                phmm_result = execute(["hmmscan",
+                                       "-o", out.name,
+                                       "--tblout", tbl.name,
+                                       "--noali",
+                                       hmmdb,
+                                       query.name])
+                if not phmm_result.successful():
+                    raise RuntimeError("SANDPUMA pHMM processing returned %d: %r" % (
+                        phmm_result.return_code, phmm_result.stderr.replace("\n", "") ))
+                if os.path.exists(tbl.name):
+                    with open(tbl.name, "r") as res:
+                        for line in res:
+                            line = line.strip()
+                            if re.match("^\w+\S*\s", line) is not None:
+                                hit = re.sub(r"^(\w+\S*)\s.+$", "\g<1>", line)
+                                hit = re.sub(r"^(.+)_\S+$", "\g<1>", hit)
+                                return hit
+                else:
+                    return 'no_call'
+
+def run_pid_sandpuma(queryfa: Dict[str, str], db: str) -> float:
+    """ Runs protein percent ID calculation for SANDPUMA
+
+        Arguments:
+            queryfa: single entry fasta Dictionary of seq names (str) to seqs (str)
+            knownfaa: path to the training fasta
+
+        Returns:
+            percent identity
+    """
+    fnames, fseqs = [], []
+    for k, v in queryfa.items():
+        fnames.append(k)
+        fseqs.append(v)
+    with NamedTemporaryFile(mode="w+") as query:
+        write_fasta(fnames, fseqs, query.name)
+        with NamedTemporaryFile(mode="w+") as bp:
+            with NamedTemporaryFile(mode="w+") as o:
+                bp_result = execute(["diamond", "blastp",
+                                     "--query", query.name,
+                                     "--db", db,
+                                     "--out", bp.name,
+                                     "--evalue", "1e-10",
+                                     "--query-cover", "50"],
+                                    stdout=o)
+                if not bp_result.successful():
+                    raise RuntimeError("diamond blastp (SANDPUMA pid) returned %d: %r" % (
+                        bp_result.return_code, bp_result.stderr.replace("\n", "") ))
+                bit, pid = 0, 0
+                with open(bp.name, "r") as res:
+                    for line in res:
+                        line = line.strip()
+                        l = line.split("\t")
+                        if bit < float(l[-1]):
+                            pid = float(l[2])
+                            bit = float(l[-1])
+                return pid
